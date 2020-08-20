@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import argparse
 import json
 import logging
 import re
@@ -91,12 +92,6 @@ _token_schema = validate.Schema(
     },
     validate.get("chansub")
 )
-_user_schema = validate.Schema(
-    {
-        validate.optional("display_name"): validate.text
-    },
-    validate.get("display_name")
-)
 _stream_schema = validate.Schema(
     {
         "stream": validate.any(None, {
@@ -123,38 +118,17 @@ _video_schema = validate.Schema(
         "end_offset": int,
     }
 )
-_viewer_info_schema = validate.Schema(
-    {
-        validate.optional("login"): validate.text
-    },
-    validate.get("login")
-)
-_viewer_token_schema = validate.Schema(
-    {
-        validate.optional("token"): validate.text
-    },
-    validate.get("token")
-)
 
-
-Segment = namedtuple("Segment", "uri duration title key discontinuity scte35 byterange date map")
+Segment = namedtuple("Segment", "uri duration title key discontinuity ad byterange date map")
 
 LOW_LATENCY_MAX_LIVE_EDGE = 2
 
 
-def parse_condition(attr):
-    def wrapper(func):
-        def method(self, *args, **kwargs):
-            if hasattr(self.stream, attr) and getattr(self.stream, attr, False):
-                func(self, *args, **kwargs)
-        return method
-    return wrapper
-
-
 class TwitchM3U8Parser(M3U8Parser):
-    def __init__(self, base_uri=None, stream=None, **kwargs):
-        M3U8Parser.__init__(self, base_uri, **kwargs)
-        self.stream = stream
+    def __init__(self, base_uri=None, disable_ads=False, low_latency=False, **kwargs):
+        super(TwitchM3U8Parser, self).__init__(base_uri, **kwargs)
+        self.disable_ads = disable_ads
+        self.low_latency = low_latency
         self.has_prefetch_segments = False
 
     def parse(self, *args):
@@ -163,21 +137,16 @@ class TwitchM3U8Parser(M3U8Parser):
 
         return m3u8
 
-    @parse_condition("disable_ads")
-    def parse_tag_ext_x_scte35_out(self, value):
-        self.state["scte35"] = True
+    def parse_extinf(self, value):
+        duration, title = super(TwitchM3U8Parser, self).parse_extinf(value)
+        if title and str(title).startswith("Amazon") and self.disable_ads:
+            self.state["ad"] = True
 
-    # unsure if this gets used by Twitch
-    @parse_condition("disable_ads")
-    def parse_tag_ext_x_scte35_out_cont(self, value):
-        self.state["scte35"] = True
+        return duration, title
 
-    @parse_condition("disable_ads")
-    def parse_tag_ext_x_scte35_in(self, value):
-        self.state["scte35"] = False
-
-    @parse_condition("low_latency")
     def parse_tag_ext_x_twitch_prefetch(self, value):
+        if not self.low_latency:
+            return
         self.has_prefetch_segments = True
         segments = self.m3u8.segments
         if segments:
@@ -190,7 +159,7 @@ class TwitchM3U8Parser(M3U8Parser):
         map_ = self.state.get("map")
         key = self.state.get("key")
         discontinuity = self.state.pop("discontinuity", False)
-        scte35 = self.state.pop("scte35", None)
+        ad = self.state.pop("ad", False)
 
         return Segment(
             uri,
@@ -198,7 +167,7 @@ class TwitchM3U8Parser(M3U8Parser):
             extinf[1],
             key,
             discontinuity,
-            scte35,
+            ad,
             byterange,
             date,
             map_
@@ -206,17 +175,36 @@ class TwitchM3U8Parser(M3U8Parser):
 
 
 class TwitchHLSStreamWorker(HLSStreamWorker):
-    def _reload_playlist(self, text, url):
-        return load_hls_playlist(text, url, parser=TwitchM3U8Parser, stream=self.stream)
+    def __init__(self, *args, **kwargs):
+        self.playlist_reloads = 0
+        super(TwitchHLSStreamWorker, self).__init__(*args, **kwargs)
 
-    def _set_playlist_reload_time(self, playlist, sequences):
-        if not self.stream.low_latency:
-            super(TwitchHLSStreamWorker, self)._set_playlist_reload_time(playlist, sequences)
-        else:
-            self.playlist_reload_time = sequences[-1].segment.duration
+    def _reload_playlist(self, text, url):
+        self.playlist_reloads += 1
+        playlist = load_hls_playlist(
+            text,
+            url,
+            parser=TwitchM3U8Parser,
+            disable_ads=self.stream.disable_ads,
+            low_latency=self.stream.low_latency
+        )
+        if (
+            self.stream.disable_ads
+            and self.playlist_reloads == 1
+            and not next((s for s in playlist.segments if not s.ad), False)
+        ):
+            log.info("Waiting for pre-roll ads to finish, be patient")
+
+        return playlist
+
+    def _playlist_reload_time(self, playlist, sequences):
+        if self.stream.low_latency and sequences:
+            return sequences[-1].segment.duration
+
+        return super(TwitchHLSStreamWorker, self)._playlist_reload_time(playlist, sequences)
 
     def process_sequences(self, playlist, sequences):
-        if self.playlist_sequence < 0 and self.stream.low_latency and not playlist.has_prefetch_segments:
+        if self.stream.low_latency and self.playlist_reloads == 1 and not playlist.has_prefetch_segments:
             log.info("This is not a low latency stream")
 
         return super(TwitchHLSStreamWorker, self).process_sequences(playlist, sequences)
@@ -224,38 +212,20 @@ class TwitchHLSStreamWorker(HLSStreamWorker):
 
 class TwitchHLSStreamWriter(HLSStreamWriter):
     def write(self, sequence, *args, **kwargs):
-        if self.stream.disable_ads:
-            if sequence.segment.scte35 is not None:
-                self.reader.ads = sequence.segment.scte35
-                if self.reader.ads:
-                    log.info("Will skip ads beginning with segment {0}".format(sequence.num))
-                else:
-                    log.info("Will stop skipping ads beginning with segment {0}".format(sequence.num))
-            if self.reader.ads:
-                return
-        return HLSStreamWriter.write(self, sequence, *args, **kwargs)
+        if not (self.stream.disable_ads and sequence.segment.ad):
+            return super(TwitchHLSStreamWriter, self).write(sequence, *args, **kwargs)
 
 
 class TwitchHLSStreamReader(HLSStreamReader):
     __worker__ = TwitchHLSStreamWorker
     __writer__ = TwitchHLSStreamWriter
-    ads = None
 
 
 class TwitchHLSStream(HLSStream):
     def __init__(self, *args, **kwargs):
-        HLSStream.__init__(self, *args, **kwargs)
-
-        disable_ads = self.session.get_plugin_option("twitch", "disable-ads")
-        low_latency = self.session.get_plugin_option("twitch", "low-latency")
-
-        if low_latency and disable_ads:
-            log.info("Low latency streaming with ad filtering is currently not supported")
-            self.session.set_plugin_option("twitch", "low-latency", False)
-            low_latency = False
-
-        self.disable_ads = disable_ads
-        self.low_latency = low_latency
+        super(TwitchHLSStream, self).__init__(*args, **kwargs)
+        self.disable_ads = self.session.get_plugin_option("twitch", "disable-ads")
+        self.low_latency = self.session.get_plugin_option("twitch", "low-latency")
 
     def open(self):
         if self.disable_ads:
@@ -311,13 +281,9 @@ class UsherService(object):
 
 class TwitchAPI(object):
     def __init__(self, session, beta=False, version=3):
-        self.oauth_token = None
         self.session = session
         self.subdomain = beta and "betaapi" or "api"
         self.version = version
-
-    def add_cookies(self, cookies):
-        self.session.http.parse_cookies(cookies, domain="twitch.tv")
 
     def call(self, path, format="json", schema=None, private=False, **extra_params):
         params = dict(as3="t", **extra_params)
@@ -330,11 +296,6 @@ class TwitchAPI(object):
         headers = {'Accept': 'application/vnd.twitchtv.v{0}+json'.format(self.version),
                    'Client-ID': TWITCH_CLIENT_ID if not private else TWITCH_CLIENT_ID_PRIVATE}
 
-        # OAuth tokens created from Streamlink's own client-id can't be used anymore on the private API (#2680)
-        # Since we don't know the origin of the provided OAuth token, we unfortunately need to disable all
-        if self.oauth_token and not private:
-            headers["Authorization"] = "OAuth {}".format(self.oauth_token)
-
         res = self.session.http.get(url, params=params, headers=headers)
 
         if format == "json":
@@ -345,14 +306,12 @@ class TwitchAPI(object):
     def call_subdomain(self, subdomain, path, format="json", schema=None, **extra_params):
         subdomain_buffer = self.subdomain
         self.subdomain = subdomain
-        response = self.call(path, format=format, schema=schema, **extra_params)
-        self.subdomain = subdomain_buffer
-        return response
+        try:
+            return self.call(path, format=format, schema=schema, **extra_params)
+        finally:
+            self.subdomain = subdomain_buffer
 
     # Public API calls
-
-    def user(self, **params):
-        return self.call("/kraken/user", **params)
 
     def users(self, **params):
         return self.call("/kraken/users", **params)
@@ -370,12 +329,6 @@ class TwitchAPI(object):
 
     def access_token(self, endpoint, asset, **params):
         return self.call("/api/{0}/{1}/access_token".format(endpoint, asset), private=True, **params)
-
-    def token(self, **params):
-        return self.call("/api/viewer/token", private=True, **params)
-
-    def viewer_info(self, **params):
-        return self.call("/api/viewer/info", private=True, **params)
 
     def hosted_channel(self, **params):
         return self.call_subdomain("tmi", "/hosts", format="", **params)
@@ -397,27 +350,12 @@ class Twitch(Plugin):
         PluginArgument(
             "oauth-token",
             sensitive=True,
-            metavar="TOKEN",
-            help="""
-            An OAuth token to use for Twitch authentication.
-            Use --twitch-oauth-authenticate to create a token.
-            """
+            help=argparse.SUPPRESS
         ),
         PluginArgument(
             "cookie",
             sensitive=True,
-            metavar="COOKIES",
-            help="""
-            Twitch cookies to authenticate to allow access to subscription channels.
-
-            Example:
-
-              "_twitch_session_id=xxxxxx; persistent=xxxxx"
-
-            Note: This method is the old and clunky way of authenticating with
-            Twitch, using --twitch-oauth-authenticate is the recommended and
-            simpler way of doing it now.
-            """
+            help=argparse.SUPPRESS
         ),
         PluginArgument(
             "disable-hosting",
@@ -585,34 +523,6 @@ class Twitch(Plugin):
         else:
             raise PluginError("Unable to find channel: {0}".format(channel))
 
-    def _authenticate(self):
-        if self.api.oauth_token:
-            return
-
-        oauth_token = self.options.get("oauth_token")
-        cookies = self.options.get("cookie")
-
-        if oauth_token:
-            log.info("Attempting to authenticate using OAuth token")
-            self.api.oauth_token = oauth_token
-            user = self.api.user(schema=_user_schema)
-
-            if user:
-                log.info("Successfully logged in as {0}".format(user))
-            else:
-                log.error("Failed to authenticate, the access token is invalid or missing required scope")
-        elif cookies:
-            log.info("Attempting to authenticate using cookies")
-
-            self.api.add_cookies(cookies)
-            self.api.oauth_token = self.api.token(schema=_viewer_token_schema)
-            login = self.api.viewer_info(schema=_viewer_info_schema)
-
-            if login:
-                log.info("Successfully logged in as {0}".format(login))
-            else:
-                log.error("Failed to authenticate, your cookies may have expired")
-
     def _create_playlist_streams(self, videos):
         start_offset = int(videos.get("start_offset", 0))
         stop_offset = int(videos.get("end_offset", 0))
@@ -718,7 +628,6 @@ class Twitch(Plugin):
 
     def _get_video_streams(self):
         log.debug("Getting video steams for {0} (type={1})".format(self.video_id, self.video_type))
-        self._authenticate()
 
         if self.video_type == "b":
             self.video_type = "a"
@@ -781,7 +690,6 @@ class Twitch(Plugin):
 
     def _get_hls_streams(self, stream_type="live"):
         log.debug("Getting {0} HLS streams for {1}".format(stream_type, self.channel))
-        self._authenticate()
         self._hosted_chain.append(self.channel)
 
         if stream_type == "live":
