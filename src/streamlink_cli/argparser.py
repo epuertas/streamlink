@@ -277,11 +277,7 @@ def build_parser():
     )
     general.add_argument(
         "--twitch-oauth-authenticate",
-        action="store_true",
-        help="""
-        Open a web browser where you can grant Streamlink access to your Twitch
-        account which creates a token for use with --twitch-oauth-token.
-        """
+        help=argparse.SUPPRESS
     )
 
     player = parser.add_argument_group("Player options")
@@ -770,6 +766,20 @@ def build_parser():
         giving up.
 
         Default is 3.
+        """
+    )
+    transport.add_argument(
+        "--hls-playlist-reload-time",
+        metavar="TIME",
+        help="""
+        Set a custom HLS playlist reload time value, either in seconds
+        or by using one of the following keywords:
+
+            segment: The duration of the last segment in the current playlist
+            live-edge: The sum of segment durations of the live edge value minus one
+            default: The playlist's target duration metadata
+
+        Default is default.
         """
     )
     transport.add_argument(
